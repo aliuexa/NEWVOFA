@@ -1,0 +1,11 @@
+[package]
+name = "newvofa-serial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newvofa-protocol = { path = "../protocol" }
+serialport = "4"
+crossbeam = "0.8"
+log = "0.4"

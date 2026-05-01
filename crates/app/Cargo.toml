@@ -1,0 +1,17 @@
+[package]
+name = "newvofa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+newvofa-protocol = { path = "../protocol" }
+newvofa-serial = { path = "../serial" }
+newvofa-buffer = { path = "../buffer" }
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+crossbeam = "0.8"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
