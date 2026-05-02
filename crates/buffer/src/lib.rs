@@ -92,11 +92,14 @@ impl DataStore {
     }
 
     pub fn resize_channels(&mut self, num_channels: usize, max_points: usize) {
-        self.channels.clear();
-        self.channels = (0..num_channels)
-            .map(|_| RingBuffer::new(max_points))
-            .collect();
-        self.sample_count = 0;
+        let old_len = self.channels.len();
+        if num_channels > old_len {
+            for _ in old_len..num_channels {
+                self.channels.push(RingBuffer::new(max_points));
+            }
+        } else if num_channels < old_len {
+            self.channels.truncate(num_channels);
+        }
     }
 }
 

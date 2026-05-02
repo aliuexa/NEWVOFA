@@ -39,6 +39,7 @@ struct VofaApp {
     num_channels: usize,
     max_points: usize,
 
+    auto_detect: bool,
     paused: bool,
     show_channel: Vec<bool>,
     follow_data: bool,
@@ -69,6 +70,7 @@ impl VofaApp {
             data_store: Arc::new(Mutex::new(DataStore::new(num_channels, max_points))),
             num_channels,
             max_points,
+            auto_detect: true,
             paused: false,
             show_channel: vec![true; num_channels],
             follow_data: true,
@@ -128,6 +130,11 @@ impl VofaApp {
             while let Ok(msg) = receiver.try_recv() {
                 match msg {
                     SerialMessage::Frame(frame) => {
+                        if self.auto_detect && frame.len() != self.num_channels {
+                            self.num_channels = frame.len();
+                            self.show_channel = vec![true; frame.len()];
+                            store.resize_channels(frame.len(), self.max_points);
+                        }
                         if !self.paused {
                             store.push_frame(&frame);
                         }
@@ -336,15 +343,21 @@ impl VofaApp {
         ui.add_space(16.0);
         ui.heading("Channels");
 
+        ui.checkbox(&mut self.auto_detect, "Auto-detect from frame");
+
         ui.horizontal(|ui| {
             ui.label("Count:");
-            let mut count = self.num_channels;
-            if ui
-                .add(egui::DragValue::new(&mut count).range(1..=100))
-                .changed()
-            {
-                self.num_channels = count;
-                self.apply_channel_count();
+            if self.auto_detect {
+                ui.label(format!("{} (auto)", self.num_channels));
+            } else {
+                let mut count = self.num_channels;
+                if ui
+                    .add(egui::DragValue::new(&mut count).range(1..=100))
+                    .changed()
+                {
+                    self.num_channels = count;
+                    self.apply_channel_count();
+                }
             }
         });
 
