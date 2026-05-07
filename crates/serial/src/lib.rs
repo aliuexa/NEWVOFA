@@ -1,5 +1,5 @@
 use crossbeam::channel::{self, Receiver};
-use newvofa_protocol::JustFloatParser;
+use newvofa_protocol::{Frame, ParameterEntry, UnifiedParser};
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,8 +7,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Debug, Clone)]
 pub enum SerialMessage {
     Frame(Vec<f32>),
+    Parameter(Vec<ParameterEntry>),
     RawData(Vec<u8>),
 }
 
@@ -79,7 +81,7 @@ impl SerialManager {
         let read_thread = thread::Builder::new()
             .name("serial-reader".into())
             .spawn(move || {
-                let mut parser = JustFloatParser::new();
+                let mut parser = UnifiedParser::new();
                 let mut buf = [0u8; 1024];
 
                 while running_clone.load(Ordering::Relaxed) {
@@ -94,8 +96,17 @@ impl SerialManager {
                             }
                             let frames = parser.feed_bytes(&buf[..n]);
                             for frame in frames {
-                                if tx.send(SerialMessage::Frame(frame)).is_err() {
-                                    return;
+                                match frame {
+                                    Frame::JustFloat(data) => {
+                                        if tx.send(SerialMessage::Frame(data)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Frame::Parameter(entries) => {
+                                        if tx.send(SerialMessage::Parameter(entries)).is_err() {
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }

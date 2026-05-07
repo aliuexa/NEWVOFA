@@ -4,6 +4,7 @@ use egui::Color32;
 use egui_plot::{Line, Plot, PlotPoints};
 use newvofa_buffer::DataStore;
 use newvofa_serial::{SerialConfig, SerialManager, SerialMessage};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
@@ -25,6 +26,126 @@ const CHANNEL_COLORS: [Color32; 16] = [
     Color32::from_rgb(255, 200, 100),
     Color32::from_rgb(100, 200, 255),
 ];
+
+const FUNC_COLORS: [Color32; 8] = [
+    Color32::from_rgb(255, 255, 255),
+    Color32::from_rgb(255, 160, 60),
+    Color32::from_rgb(200, 120, 255),
+    Color32::from_rgb(60, 255, 160),
+    Color32::from_rgb(255, 220, 40),
+    Color32::from_rgb(100, 255, 255),
+    Color32::from_rgb(255, 100, 200),
+    Color32::from_rgb(160, 255, 60),
+];
+
+fn extract_var_names(expr: &str, aliases: &[String]) -> Vec<String> {
+    let builtins: &[&str] = &[
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+        "sqrt", "abs", "exp", "ln", "log2", "log10",
+        "floor", "ceil", "round", "signum",
+        "max", "min", "pi", "e",
+    ];
+    let chars: Vec<char> = expr.chars().collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if !builtins.contains(&word.as_str()) && aliases.iter().any(|a| !a.is_empty() && a.as_str() == word.as_str()) {
+                if !names.contains(&word) {
+                    names.push(word);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
+struct FuncEntry {
+    expression: String,
+    show: bool,
+    error: Option<String>,
+    var_names: Vec<String>,
+}
+
+impl FuncEntry {
+    fn new() -> Self {
+        Self {
+            expression: String::new(),
+            show: true,
+            error: None,
+            var_names: Vec::new(),
+        }
+    }
+
+    fn parse(&mut self, aliases: &[String]) {
+        self.error = None;
+        self.var_names.clear();
+
+        let trimmed = self.expression.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let expr_result: Result<meval::Expr, _> = trimmed.parse();
+        match expr_result {
+            Ok(_expr) => {
+                self.var_names = extract_var_names(trimmed, aliases);
+            }
+            Err(e) => {
+                self.error = Some(format!("Parse: {}", e));
+            }
+        }
+    }
+
+    fn eval_point(&self, aliases: &[String], all_channels: &[&newvofa_buffer::RingBuffer<f32>], sample_idx: usize) -> Option<f64> {
+        if self.expression.trim().is_empty() || self.var_names.is_empty() {
+            return None;
+        }
+        let trimmed = self.expression.trim();
+        let expr: meval::Expr = trimmed.parse().ok()?;
+        let mut ctx = meval::Context::new();
+        for name in &self.var_names {
+            if let Some(ch_idx) = aliases.iter().position(|a| !a.is_empty() && a == name.as_str()) {
+                if let Some(ch) = all_channels.get(ch_idx) {
+                    if let Some(&v) = ch.get(sample_idx) {
+                        ctx.var(name.clone(), v as f64);
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        let result = expr.eval_with_context(ctx).ok()?;
+        if result.is_finite() {
+            Some(result)
+        } else {
+            None
+        }
+    }
+}
+
+impl Clone for FuncEntry {
+    fn clone(&self) -> Self {
+        Self {
+            expression: self.expression.clone(),
+            show: self.show,
+            error: self.error.clone(),
+            var_names: self.var_names.clone(),
+        }
+    }
+}
 
 struct VofaApp {
     serial_manager: Option<SerialManager>,
@@ -53,6 +174,12 @@ struct VofaApp {
     ch_drag_rect: Option<egui::Rect>,
     ch_drag_target: bool,
     row_rects: Vec<(usize, egui::Rect)>,
+
+    channel_aliases: Vec<String>,
+    func_entries: Vec<FuncEntry>,
+
+    parameters: BTreeMap<String, f32>,
+    param_edits: BTreeMap<String, String>,
 }
 
 impl VofaApp {
@@ -83,6 +210,10 @@ impl VofaApp {
             ch_drag_rect: None,
             ch_drag_target: false,
             row_rects: Vec::new(),
+            channel_aliases: vec![String::new(); num_channels],
+            func_entries: Vec::new(),
+            parameters: BTreeMap::new(),
+            param_edits: BTreeMap::new(),
         }
     }
 
@@ -133,6 +264,7 @@ impl VofaApp {
                         if self.auto_detect && frame.len() != self.num_channels {
                             self.num_channels = frame.len();
                             self.show_channel = vec![true; frame.len()];
+                            self.channel_aliases.resize(frame.len(), String::new());
                             store.resize_channels(frame.len(), self.max_points);
                         }
                         if !self.paused {
@@ -142,6 +274,12 @@ impl VofaApp {
                     SerialMessage::RawData(raw) => {
                         if !self.raw_hex_paused {
                             raw_chunks.push(raw);
+                        }
+                    }
+                    SerialMessage::Parameter(entries) => {
+                        for entry in entries {
+                            self.parameters.insert(entry.name.clone(), entry.value);
+                            self.param_edits.entry(entry.name.clone()).or_insert_with(|| entry.value.to_string());
                         }
                     }
                 }
@@ -199,6 +337,7 @@ impl VofaApp {
         let count = self.num_channels.max(1).min(100);
         self.num_channels = count;
         self.show_channel = vec![true; count];
+        self.channel_aliases.resize(count, String::new());
         self.data_store
             .lock()
             .resize_channels(count, self.max_points);
@@ -249,7 +388,7 @@ impl eframe::App for VofaApp {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("NEWVOFA - Serial Plot");
+                ui.heading("Gmaster Serial Viewer - Serial Plot");
                 ui.separator();
                 ui.label(&self.status_message);
             });
@@ -294,6 +433,7 @@ impl eframe::App for VofaApp {
 
 impl VofaApp {
     fn render_control_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
         ui.heading("Serial Port");
 
         ui.horizontal(|ui| {
@@ -407,22 +547,26 @@ impl VofaApp {
 
         let mut row_rects: Vec<(usize, egui::Rect)> = Vec::new();
 
-        egui::ScrollArea::vertical()
-            .max_height(200.0)
-            .show(ui, |ui| {
-                for i in 0..self.num_channels {
-                    let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
-                    let row = ui.horizontal(|ui| {
-                        ui.colored_label(color, format!("CH{}", i + 1));
-                        if self.show_channel.len() > i {
-                            ui.add(egui::Checkbox::without_text(
-                                &mut self.show_channel[i],
-                            ));
-                        }
-                    });
-                    row_rects.push((i, row.response.rect));
+        for i in 0..self.num_channels {
+            let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+            let row = ui.horizontal(|ui| {
+                ui.colored_label(color, format!("CH{}", i + 1));
+                ui.set_min_width(36.0);
+                if self.show_channel.len() > i {
+                    ui.add(egui::Checkbox::without_text(
+                        &mut self.show_channel[i],
+                    ));
+                    if self.channel_aliases.len() > i {
+                        ui.add_sized(
+                            [50.0, 18.0],
+                            egui::TextEdit::singleline(&mut self.channel_aliases[i])
+                                .hint_text("alias"),
+                        );
+                    }
                 }
             });
+            row_rects.push((i, row.response.rect));
+        }
 
         ui.style_mut().interaction.selectable_labels = old_selectable;
         self.row_rects = row_rects;
@@ -448,6 +592,142 @@ impl VofaApp {
             .clicked()
         {
             self.send_command();
+        }
+
+        ui.add_space(16.0);
+        self.render_param_ui(ui);
+        ui.add_space(16.0);
+        self.render_func_ui(ui);
+        });
+    }
+
+    fn send_param_update(&mut self, name: &str) {
+        let val_str = match self.param_edits.get(name) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let value: f32 = match val_str.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                self.status_message = format!("Invalid value for {}", name);
+                return;
+            }
+        };
+        if let Some(ref mut manager) = self.serial_manager {
+            match manager.send_command(name, value) {
+                Ok(()) => {
+                    self.status_message = format!("Sent: {}:{}", name, value);
+                }
+                Err(e) => {
+                    self.status_message = e;
+                }
+            }
+        }
+    }
+
+    fn render_param_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Parameters");
+
+        if self.parameters.is_empty() {
+            ui.label("(waiting for parameter data...)");
+            return;
+        }
+
+        for (name, value) in self.parameters.clone().iter() {
+            ui.horizontal(|ui| {
+                ui.label(name);
+                ui.colored_label(Color32::from_rgb(100, 200, 255), format!("{:.3}", value));
+
+                let edit = self.param_edits.entry(name.clone()).or_insert_with(|| value.to_string());
+                ui.add_sized(
+                    [80.0, 20.0],
+                    egui::TextEdit::singleline(edit).hint_text("new value"),
+                );
+
+                if ui.small_button("Set").clicked() {
+                    self.send_param_update(name);
+                }
+            });
+        }
+    }
+
+    fn render_func_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Functions");
+
+        let aliases = self.channel_aliases.clone();
+        for entry in &mut self.func_entries {
+            entry.parse(&aliases);
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("+ Add").clicked() {
+                self.func_entries.push(FuncEntry::new());
+            }
+            if ui.button("Clear All").clicked() {
+                self.func_entries.clear();
+            }
+        });
+
+        let mut remove_idx: Option<usize> = None;
+        let entries = &mut self.func_entries;
+
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let color = FUNC_COLORS[i % FUNC_COLORS.len()];
+
+            ui.horizontal(|ui| {
+                let mut show = entry.show;
+                if ui.add(egui::Checkbox::new(&mut show, "")).changed() {
+                    entry.show = show;
+                }
+
+                let text_id = egui::Id::new(("func_expr", i));
+                let mut expr = entry.expression.clone();
+                let text_response = ui.add_sized(
+                    [ui.available_width() - 30.0, 20.0],
+                    egui::TextEdit::singleline(&mut expr)
+                        .id(text_id)
+                        .hint_text("e.g. a*sin(b)+c"),
+                );
+                if text_response.changed() && expr != entry.expression {
+                    entry.expression = expr;
+                }
+
+                if ui
+                    .add_sized([20.0, 20.0], egui::Button::new("✕"))
+                    .clicked()
+                {
+                    remove_idx = Some(i);
+                }
+            });
+
+            if let Some(ref err) = entry.error {
+                ui.colored_label(Color32::from_rgb(255, 80, 80), err);
+            } else if !entry.expression.trim().is_empty() && entry.var_names.is_empty() {
+                ui.colored_label(
+                    Color32::from_rgb(160, 160, 160),
+                    "(no matching aliases)",
+                );
+            } else if !entry.expression.trim().is_empty() {
+                let vars: Vec<String> = entry
+                    .var_names
+                    .iter()
+                    .map(|name| {
+                        let idx = self.channel_aliases.iter().position(|a| a == name.as_str());
+                        match idx {
+                            Some(ch) => format!("{}->CH{}", name, ch + 1),
+                            None => format!("{}->?", name),
+                        }
+                    })
+                    .collect();
+                ui.colored_label(
+                    color,
+                    format!("  binds: {}", vars.join(", ")),
+                );
+            }
+        }
+
+        if let Some(idx) = remove_idx {
+            self.func_entries.remove(idx);
         }
     }
 
@@ -514,6 +794,48 @@ impl VofaApp {
 
                 if !points_vec.is_empty() {
                     all_lines.push((points_vec, color, format!("CH{}", i + 1)));
+                }
+            }
+        }
+
+        if !self.func_entries.is_empty() {
+            let channel_refs: Vec<&newvofa_buffer::RingBuffer<f32>> = (0..self.num_channels)
+                .filter_map(|i| store.channel_data(i))
+                .collect();
+
+            let min_len = channel_refs.iter().map(|c| c.len()).min().unwrap_or(0);
+            let vis_len = if follow {
+                (min_len as u64).min(window) as usize
+            } else {
+                min_len
+            };
+            let vis_start = sample_count.saturating_sub(vis_len as u64);
+            let skip = min_len.saturating_sub(vis_len);
+
+            for (fi, entry) in self.func_entries.iter().enumerate() {
+                if !entry.show || entry.expression.trim().is_empty() || entry.var_names.is_empty() {
+                    continue;
+                }
+                if vis_len == 0 {
+                    continue;
+                }
+
+                let color = FUNC_COLORS[fi % FUNC_COLORS.len()];
+                let mut points = Vec::with_capacity(vis_len);
+
+                for j in 0..vis_len {
+                    let idx = skip + j;
+                    if let Some(result) = entry.eval_point(&self.channel_aliases, &channel_refs, idx) {
+                        let x = (vis_start + j as u64) as f64;
+                        points.push([x, result]);
+                        y_min = Some(y_min.map_or(result, |v| v.min(result)));
+                        y_max = Some(y_max.map_or(result, |v| v.max(result)));
+                    }
+                }
+
+                if !points.is_empty() {
+                    let label = format!("f{}: {}", fi + 1, entry.expression);
+                    all_lines.push((points, color, label));
                 }
             }
         }
@@ -594,12 +916,12 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
-            .with_title("NEWVOFA"),
+            .with_title("Gmaster Serial Viewer"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "NEWVOFA",
+        "Gmaster Serial Viewer",
         options,
         Box::new(|_cc| Ok(Box::new(VofaApp::new()))),
     )

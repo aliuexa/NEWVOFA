@@ -29,6 +29,10 @@ impl<T: Clone> RingBuffer<T> {
         self.buffer.is_empty()
     }
 
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.buffer.get(index)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.buffer.iter()
     }
